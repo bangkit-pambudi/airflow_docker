@@ -1,0 +1,13 @@
+pandas
+SQLAlchemy
+secure-smtplib
+email-to
+matplotlib
+data-diff
+openmetadata-ingestion==1.5.6
+scikit-learn
+cloudscraper
+gspread
+gspread-dataframe
+openpyxl
+boto3
