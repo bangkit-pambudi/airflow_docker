@@ -1,20 +1,35 @@
 import os
 import subprocess
+import boto3
 from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.hooks.base import BaseHook
+from airflow.models import Variable
+from botocore.client import Config
 
-# --- Konfigurasi ---
-MINIO_CONN_ID = 'minio_conn'
-MINIO_BUCKET = 'airflow-db-backups'
-AIRFLOW_DB_CONN_ID = 'airflow_db' # ID koneksi database metadatadb kamu
+# --- Konfigurasi Menggunakan Airflow Variables ---
+MINIO_ENDPOINT = Variable.get("MINIO_ENDPOINT")      # host.docker.internal:9000
+MINIO_ACCESS   = Variable.get("MINIO_ACCESS_KEY")    # minioadmin
+MINIO_SECRET   = Variable.get("MINIO_SECRET_KEY")    # minioadmin123
+MINIO_BUCKET   = Variable.get("MINIO_BUCKET") # airflow-db-backups (sesuaikan key-nya)
+MINIO_SECURE   = False
+
+AIRFLOW_DB_CONN_ID = 'airflow_db' # ID koneksi database metadata di UI Airflow
 
 def dump_db_and_upload_to_minio(ds, **kwargs):
-    # 1. Ambil kredensial database dengan aman dari Airflow Connections
+    # 1. Ambil kredensial database dari Airflow Connections
     db_conn = BaseHook.get_connection(AIRFLOW_DB_CONN_ID)
-    s3_hook = S3Hook(aws_conn_id=MINIO_CONN_ID)
+    
+    # Inisialisasi S3 Client untuk Minio
+    s3_client = boto3.client(
+        's3',
+        endpoint_url=f"http://{MINIO_ENDPOINT}" if not MINIO_SECURE else f"https://{MINIO_ENDPOINT}",
+        aws_access_key_id=MINIO_ACCESS,
+        aws_secret_access_key=MINIO_SECRET,
+        config=Config(signature_version='s3v4'),
+        verify=MINIO_SECURE
+    )
     
     # 2. Setup nama file dan direktori sementara
     date_partition = ds.replace('-', '/') # Contoh: 2024/03/31
@@ -23,17 +38,17 @@ def dump_db_and_upload_to_minio(ds, **kwargs):
     
     print(f"Memulai proses pg_dump untuk database: {db_conn.schema}")
     
-    # 3. Siapkan environment variable agar password tidak bocor di log command
+    # 3. Siapkan environment variable untuk PGPASSWORD
     env = os.environ.copy()
     env['PGPASSWORD'] = db_conn.password
     
-    # Command pg_dump dengan format custom (-F c) yang sudah otomatis terkompresi
+    # Command pg_dump
     dump_command = [
         'pg_dump',
         '-h', db_conn.host,
-        '-p', str(db_conn.port),
+        '-p', str(db_conn.port or 5432), # Default 5432 jika port tidak diisi
         '-U', db_conn.login,
-        '-F', 'c',             # Format Custom (compressed & suitable for pg_restore)
+        '-F', 'c',             # Format Custom (compressed)
         '-f', local_filepath,  # Output file
         db_conn.schema         # Nama database
     ]
@@ -45,22 +60,17 @@ def dump_db_and_upload_to_minio(ds, **kwargs):
     except subprocess.CalledProcessError as e:
         raise Exception(f"Gagal melakukan pg_dump: {e}")
 
-    # 4. Upload ke MinIO
+    # 4. Upload ke MinIO menggunakan Boto3
     dest_key = f"{date_partition}/{backup_filename}"
     print(f"Mengunggah backup ke Minio: s3://{MINIO_BUCKET}/{dest_key}")
     
     try:
-        s3_hook.load_file(
-            filename=local_filepath,
-            key=dest_key,
-            bucket_name=MINIO_BUCKET,
-            replace=True
-        )
+        s3_client.upload_file(local_filepath, MINIO_BUCKET, dest_key)
         print("Upload ke MinIO berhasil.")
     except Exception as e:
         raise Exception(f"Gagal mengunggah ke MinIO: {e}")
     finally:
-        # 5. Auto-Cleanup: Hapus file dump lokal bagaimanapun hasil uploadnya
+        # 5. Cleanup file lokal
         if os.path.exists(local_filepath):
             os.remove(local_filepath)
             print(f"File sementara {local_filepath} telah dihapus.")
@@ -74,10 +84,10 @@ default_args = {
 }
 
 with DAG(
-    'backup_metadatadb_to_minio',
+    '5d-migrate_metadatadb',
     default_args=default_args,
-    description='Backup harian Airflow Metadata DB ke MinIO',
-    schedule_interval='@daily', # Berjalan setiap hari
+    description='Backup harian Airflow Metadata DB ke MinIO via Variables',
+    schedule_interval='@daily',
     catchup=False,
     max_active_runs=1,
 ) as dag:

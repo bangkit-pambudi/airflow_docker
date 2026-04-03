@@ -1,35 +1,50 @@
 from datetime import datetime
-from airflow.decorators import dag, task
+from airflow import DAG
+from airflow.operators.python import PythonOperator
 
-@dag(
+# 1. Fungsi biasa untuk menghasilkan data dinamis (Dinamis -> op_kwargs)
+def get_regions_func():
+    """
+    Menghasilkan list berisi dictionary.
+    Setiap dictionary akan disalurkan ke parameter bernama 'region'.
+    """
+    return [
+        {"region": "US"},
+        {"region": "EU"},
+        {"region": "APAC"},
+        {"region": "LATAM"}
+    ]
+
+# 2. Fungsi biasa untuk memproses data
+# ⚠️ PENTING: Susunan argumen diubah. 
+# Yang statis di depan (untuk op_args), yang dinamis di belakang.
+def process_regional_data_func(target_bucket: str, file_format: str, region: str):
+    print(f"📥 Mengambil data untuk region: {region}...")
+    print(f"💾 Menyimpan data {region} ke bucket '{target_bucket}' dalam format .{file_format}...")
+    return f"Berhasil memproses {region}"
+
+# 3. Definisi DAG gaya klasik (Classic Way)
+with DAG(
     dag_id="4a-simple_dynamic_task_mapping",
     schedule_interval=None,
     start_date=datetime(2024, 1, 1),
     catchup=False,
-    tags=["example", "dynamic_mapping"]
-)
-def simple_dynamic_task_mapping():
+    tags=["example", "dynamic_mapping", "partial", "classic"]
+) as dag:
 
-    # 1. Task untuk menghasilkan daftar (list) data
-    @task
-    def get_items_to_process():
-        """Menghasilkan list berisi angka yang akan diproses secara dinamis."""
-        return [10, 20, 30, 40, 50]
+    # Task 1: Mengambil list region
+    task_get_regions = PythonOperator(
+        task_id="get_regions",
+        python_callable=get_regions_func
+    )
 
-    # 2. Task yang akan memproses SATU item
-    @task
-    def multiply_by_two(number: int):
-        """Memproses item secara individual."""
-        result = number * 2
-        print(f"Angka {number} dikali 2 = {result}")
-        return result
-
-    # 3. Mendefinisikan alur dan pemetaan dinamis (Dynamic Mapping)
-    items = get_items_to_process()
-    
-    # Kunci utamanya ada di .expand()
-    # Airflow akan otomatis membuat 5 task "multiply_by_two" yang berjalan paralel
-    mapped_tasks = multiply_by_two.expand(number=items)
-
-# Inisialisasi DAG
-simple_dynamic_task_mapping()
+    # Task 2: Memetakan (mapping) task secara dinamis
+    task_process_data = PythonOperator.partial(
+        task_id="process_regional_data",
+        python_callable=process_regional_data_func,
+        # ✅ STATIS diletakkan di op_args (berupa List/Array)
+        op_args=["global-sales-datalake", "parquet"]
+    ).expand(
+        # ✅ DINAMIS diletakkan di op_kwargs (mengambil dari task sebelumnya)
+        op_kwargs=task_get_regions.output
+    )

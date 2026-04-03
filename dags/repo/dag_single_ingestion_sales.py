@@ -16,16 +16,17 @@ from minio import Minio
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.models import Variable # <-- Tambahkan import ini
 
 log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────
-AW_CONN_ID     = "adventure_works"
-MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000")
-MINIO_ACCESS   = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
-MINIO_SECRET   = os.getenv("MINIO_SECRET_KEY", "minioadmin123")
-MINIO_BUCKET   = os.getenv("MINIO_BUCKET", "adventureworks-elt")
-MINIO_SECURE   = os.getenv("MINIO_SECURE", "false").lower() == "true"
+AW_CONN_ID     = "adventure_works"  # Connection ID untuk PostgreSQL di Airflow
+MINIO_ENDPOINT = Variable.get("MINIO_ENDPOINT") # host.docker.internal:9000	
+MINIO_ACCESS   = Variable.get("MINIO_ACCESS_KEY") # minioadmin
+MINIO_SECRET   = Variable.get("MINIO_SECRET_KEY") # minioadmin123
+MINIO_BUCKET   = Variable.get("MINIO_BUCKET") #adventureworks-elt
+MINIO_SECURE   = False
 
 default_args = {
     "owner": "airflow",

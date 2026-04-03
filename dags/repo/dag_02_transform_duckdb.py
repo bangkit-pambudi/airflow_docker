@@ -44,16 +44,18 @@ from minio import Minio
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.models import Variable # <-- Tambahkan import ini
 
 log = logging.getLogger(__name__)
 
 # ── Config ───────────────────────────────────────────────────
-MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000")
-MINIO_ACCESS   = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
-MINIO_SECRET   = os.getenv("MINIO_SECRET_KEY", "minioadmin123")
-MINIO_BUCKET   = os.getenv("MINIO_BUCKET", "adventureworks-elt")
-MINIO_SECURE   = os.getenv("MINIO_SECURE", "false").lower() == "true"
-DUCKDB_PATH    = os.getenv("DUCKDB_PATH", "/opt/airflow/duckdb/sales_performance.duckdb")
+AW_CONN_ID     = "adventure_works"  # Connection ID untuk PostgreSQL di Airflow
+MINIO_ENDPOINT = Variable.get("MINIO_ENDPOINT") # host.docker.internal:9000	
+MINIO_ACCESS   = Variable.get("MINIO_ACCESS_KEY") # minioadmin
+MINIO_SECRET   = Variable.get("MINIO_SECRET_KEY") # minioadmin123
+MINIO_BUCKET   = Variable.get("MINIO_BUCKET") #adventureworks-elt
+MINIO_SECURE   = False
+DUCKDB_PATH    = "/opt/airflow/dags/repo/dwh.duckdb"
 
 # S3 endpoint untuk DuckDB (http karena MinIO lokal tidak pakai HTTPS)
 S3_ENDPOINT    = f"http://{MINIO_ENDPOINT}"
@@ -140,6 +142,7 @@ def setup_duckdb_s3(**context):
 
         for folder, pk in tables_to_check:
             path = get_latest_partition(folder, logical_date)
+            print(f"🔍 Verifying access to {path}...")
             result = conn.execute(
                 f"SELECT COUNT(*) AS cnt FROM read_parquet('{path}')"
             ).fetchone()
@@ -353,189 +356,9 @@ def create_gold_layer(**context):
             "SELECT COUNT(*) FROM gold.fact_sales_performance"
         ).fetchone()[0]
         log.info(f"✅ gold.fact_sales_performance: {cnt:,} rows")
-
-        # Preview 3 baris untuk logging
-        preview = conn.execute("""
-            SELECT "ProductName", "TerritoryName", "TotalRevenue", "MarginPct"
-            FROM gold.fact_sales_performance
-            ORDER BY "TotalRevenue" DESC
-            LIMIT 3
-        """).fetchall()
-
-        log.info("Top 3 by revenue:")
-        for row in preview:
-            log.info(f"  {row[0]} | {row[1]} | Rev={row[2]:,.2f} | Margin={row[3]}%")
-
-        log.info("✅ Gold layer complete.")
     finally:
         conn.close()
 
-
-def export_gold_to_minio(**context):
-    """
-    Export gold.fact_sales_performance dari DuckDB ke MinIO
-    sebagai Parquet. Menggunakan DuckDB COPY TO dengan S3.
-
-    Path: dwh/fact_sales_performance/dt=YYYY-MM-DD/data.parquet
-    """
-    logical_date = context["ds"]
-    conn = get_minio()
-    dconn = get_duckdb_conn()
-
-    try:
-        output_path = (
-            f"{S3_PREFIX}/dwh/fact_sales_performance"
-            f"/dt={logical_date}/data.parquet"
-        )
-
-        log.info(f"Exporting gold → {output_path}...")
-
-        # DuckDB COPY TO langsung ke S3/MinIO
-        dconn.execute(f"""
-            COPY gold.fact_sales_performance
-            TO '{output_path}'
-            (FORMAT PARQUET, COMPRESSION SNAPPY);
-        """)
-
-        # Verifikasi file ada di MinIO
-        object_key = (
-            f"dwh/fact_sales_performance/dt={logical_date}/data.parquet"
-        )
-        stat = conn.stat_object(MINIO_BUCKET, object_key)
-        log.info(
-            f"✅ Exported to MinIO: {output_path} "
-            f"({stat.size/1024:.1f} KB)"
-        )
-
-        # Push path ke XCom
-        context["ti"].xcom_push(key="gold_path", value=output_path)
-
-    finally:
-        dconn.close()
-
-
-def run_analytic_queries(**context):
-    """
-    Jalankan analytic queries di DuckDB untuk demo ke murid.
-    Semua query berjalan terhadap gold.fact_sales_performance.
-    """
-    conn = get_duckdb_conn()
-
-    try:
-        log.info("=" * 60)
-        log.info("ANALYTIC QUERIES — gold.fact_sales_performance")
-        log.info("=" * 60)
-
-        # ── Q1: Top 5 produk by revenue ──────────────────────
-        log.info("\n📊 Q1: Top 5 Produk berdasarkan Total Revenue")
-        rows = conn.execute("""
-            SELECT
-                "ProductName",
-                "Category",
-                SUM("TotalRevenue")     AS "Revenue",
-                SUM("TotalQty")         AS "Qty"
-            FROM gold.fact_sales_performance
-            GROUP BY "ProductName", "Category"
-            ORDER BY "Revenue" DESC
-            LIMIT 5
-        """).fetchall()
-        for r in rows:
-            log.info(f"  {r[0][:35]:<35} | {r[1]:<15} | Rev={r[2]:>12,.2f} | Qty={r[3]:>6}")
-
-        # ── Q2: Revenue per territory ─────────────────────────
-        log.info("\n📊 Q2: Revenue per Territory")
-        rows = conn.execute("""
-            SELECT
-                "TerritoryName",
-                "CountryRegionCode",
-                SUM("TotalRevenue")             AS "Revenue",
-                COUNT(DISTINCT "ProductID")     AS "Products"
-            FROM gold.fact_sales_performance
-            GROUP BY "TerritoryName", "CountryRegionCode"
-            ORDER BY "Revenue" DESC
-        """).fetchall()
-        for r in rows:
-            log.info(f"  {r[0]:<20} | {r[1]:<5} | Rev={r[2]:>12,.2f} | {r[3]} produk")
-
-        # ── Q3: Top 5 per territory (window function) ─────────
-        log.info("\n📊 Q3: Top 3 Produk per Territory (RANK OVER PARTITION)")
-        rows = conn.execute("""
-            SELECT *
-            FROM (
-                SELECT
-                    "TerritoryName",
-                    "ProductName",
-                    "TotalRevenue",
-                    RANK() OVER (
-                        PARTITION BY "TerritoryName"
-                        ORDER BY "TotalRevenue" DESC
-                    ) AS "Rank"
-                FROM gold.fact_sales_performance
-            ) ranked
-            WHERE "Rank" <= 3
-            ORDER BY "TerritoryName", "Rank"
-        """).fetchall()
-        for r in rows:
-            log.info(f"  [{r[3]}] {r[0]:<20} | {r[1][:30]:<30} | {r[2]:>12,.2f}")
-
-        # ── Q4: Kontribusi revenue per kategori ───────────────
-        log.info("\n📊 Q4: Revenue Share per Kategori (%)")
-        rows = conn.execute("""
-            SELECT
-                "Category",
-                ROUND(SUM("TotalRevenue"), 2)                           AS "Revenue",
-                ROUND(
-                    SUM("TotalRevenue") * 100.0
-                    / SUM(SUM("TotalRevenue")) OVER ()
-                , 2)                                                    AS "SharePct"
-            FROM gold.fact_sales_performance
-            GROUP BY "Category"
-            ORDER BY "Revenue" DESC
-        """).fetchall()
-        for r in rows:
-            bar = "█" * int(r[2] / 2)
-            log.info(f"  {r[0]:<20} | {r[2]:>6}% {bar}")
-
-        # ── Q5: Margin per kategori ───────────────────────────
-        log.info("\n📊 Q5: Avg Margin per Kategori")
-        rows = conn.execute("""
-            SELECT
-                "Category",
-                "Subcategory",
-                ROUND(AVG("MarginPct"), 2)   AS "AvgMarginPct",
-                COUNT(DISTINCT "ProductID")  AS "Products"
-            FROM gold.fact_sales_performance
-            GROUP BY "Category", "Subcategory"
-            ORDER BY "AvgMarginPct" DESC
-            LIMIT 8
-        """).fetchall()
-        for r in rows:
-            log.info(f"  {r[0]:<15} > {r[1]:<25} | Margin={r[2]:>6}% | {r[3]} produk")
-
-        # ── Summary stats ─────────────────────────────────────
-        stats = conn.execute("""
-            SELECT
-                COUNT(*)                        AS total_rows,
-                COUNT(DISTINCT "ProductID")     AS total_products,
-                COUNT(DISTINCT "TerritoryID")   AS total_territories,
-                ROUND(SUM("TotalRevenue"), 2)   AS grand_revenue,
-                MAX("LoadTimestamp")            AS last_load
-            FROM gold.fact_sales_performance
-        """).fetchone()
-
-        log.info("\n" + "=" * 60)
-        log.info("GOLD LAYER SUMMARY")
-        log.info("=" * 60)
-        log.info(f"  Total rows        : {stats[0]:,}")
-        log.info(f"  Unique products   : {stats[1]:,}")
-        log.info(f"  Unique territories: {stats[2]:,}")
-        log.info(f"  Grand total rev   : {stats[3]:,.2f}")
-        log.info(f"  Load timestamp    : {stats[4]}")
-        log.info("=" * 60)
-        log.info("🎉 ELT pipeline selesai! Data siap untuk analisis.")
-
-    finally:
-        conn.close()
 
 
 # ════════════════════════════════════════════════════════════
@@ -601,22 +424,10 @@ run_analytic_queries  ← demo 5 query analitik
         python_callable=create_gold_layer,
     )
 
-    task_export = PythonOperator(
-        task_id="export_gold_to_minio",
-        python_callable=export_gold_to_minio,
-    )
-
-    task_analytics = PythonOperator(
-        task_id="run_analytic_queries",
-        python_callable=run_analytic_queries,
-    )
-
     # Pipeline sekuensial (tiap layer bergantung ke sebelumnya)
     (
         task_setup
         >> task_bronze
         >> task_silver
         >> task_gold
-        >> task_export
-        >> task_analytics
     )
